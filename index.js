@@ -30,8 +30,6 @@ function slugify(title) {
 
 async function checkExistingPost(title) {
   try {
-    console.log(`检查是否存在文章${encodeURIComponent(title)}`)
-
     const res = await axios.get(`${WP_URL}?search=${encodeURIComponent(title)}`, {
       auth: {
         username: USERNAME,
