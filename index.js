@@ -11,6 +11,8 @@ dotenv.config()
 const WP_URL = process.env.WP_URL || ''
 const USERNAME = process.env.WP_USERNAME || ''
 const PASSWORD = process.env.WP_PASSWORD || ''
+const LOGO = process.env.WP_LOGO
+const HOST = process.env.WP_HOST
 
 console.log('WP_URL:', WP_URL)
 console.log('USERNAME:', USERNAME)
@@ -38,10 +40,10 @@ async function checkExistingPost(title) {
     })
     console.log(`是否已有文章：${res.data.length > 0 ? '有' : '无'}`)
     // Check if any returned posts match the title exactly
-    const matchingPosts = res.data.filter(post => {
-      return post.slug === slugify(title)
-    })
-
+    // const matchingPosts = res.data.filter(post => {
+    //   return post.slug === slugify(title)
+    // })
+    const matchingPosts = res.data
     console.log(`匹配文章：${matchingPosts.length > 0 ? '有' : '无'}`)
     return matchingPosts.length > 0 ? matchingPosts[0] : null
   } catch (error) {
@@ -102,32 +104,77 @@ async function createPost(title, content) {
 
 function parseHTML(html) {
   const $ = load(html)
+  const articles = []
 
-  // 1. 获取标题
-  const title = $('h1').first().text().trim()
-  $("script, link[rel='stylesheet'], h1, .bc").remove()
+  // 1. 提取全局样式
+  let globalCss = $('style').html() || ''
+  if (globalCss) {
+    globalCss = globalCss.replace(/\*[\s\S]*?\{[\s\S]*?\}/, '') // 移除全局重置
+  }
 
-  // 2. 提取并优化 CSS
-  let css = $('style').html()
-  // 移除危险的全局重置，防止破坏 WP 导航栏和页脚
-  css = css.replace(/\*[\s\S]*?\{[\s\S]*?\}/, '')
+  // 2. 预清理：移除面包屑、脚本、样式表链接等
+  $("script, link[rel='stylesheet'], .bc, nav[aria-label='breadcrumb']").remove()
 
-  // 3. 提取主体内容
-  const bodyContent = $('div.w').length > 0 ? $('div.w').first() : $('body').html()
+  const h1Elements = $('h1')
 
-  // 4. 组合成一个“安全包”
-  // 使用特殊的类名包裹，确保样式隔离
-  const finalContent = `
-    <style>
-      /* 这里的 CSS 只会在当前页面加载 */
-      ${css}
-    </style>
-    <div class="custom-html-wrapper">
-      ${bodyContent}
-    </div>
-  `
+  if (h1Elements.length === 0) {
+    console.warn('未发现 H1 标签，跳过该文件')
+    return []
+  }
 
-  return { title, content: finalContent }
+  h1Elements.each((index, el) => {
+    const currentH1 = $(el)
+    const title = currentH1.text().trim()
+
+    // 获取当前 H1 到下一个 H1 之间的所有内容
+    let bodyContent = ''
+    const nodes = currentH1.nextUntil('h1')
+
+    nodes.each((i, node) => {
+      bodyContent += $.html(node)
+    })
+
+    // 如果 H1 后面完全没内容（可能是误触或空标签），视情况决定是否跳过
+    if (!bodyContent.trim()) {
+      console.log(`标题 "${title}" 下无内容，已跳过`)
+      return
+    }
+    const currentTime = new Date().toISOString()
+
+    // 3. 自动注入本周最紧急的 Article Schema
+    const schemaData = {
+      '@context': 'https://schema.org',
+      '@type': 'Article',
+      headline: title,
+      datePublished: currentTime,
+      dateModified: currentTime,
+      author: {
+        '@type': 'Organization',
+        name: 'Futurum Academy',
+      },
+      publisher: {
+        '@type': 'Organization',
+        name: 'Futurum Academy',
+        url: HOST,
+        logo: LOGO,
+      },
+    }
+
+    const finalContent = `
+<script type="application/ld+json">
+${JSON.stringify(schemaData, null, 2)}
+</script>
+<style>
+  ${globalCss}
+</style>
+<div class="custom-html-wrapper">
+  ${bodyContent}
+</div>
+    `
+    articles.push({ title, content: finalContent })
+  })
+
+  return articles
 }
 
 async function run() {
@@ -142,39 +189,30 @@ async function run() {
     if (!file.endsWith('.html')) continue
 
     const filePath = path.join(dir, file)
-    let html = fs.readFileSync(filePath, 'utf-8')
+    const html = fs.readFileSync(filePath, 'utf-8')
 
-    const { title, content } = parseHTML(html)
+    const articles = parseHTML(html)
 
-    // Skip if title is empty
-    if (!title || title.trim() === '') {
-      console.log(`Skipping ${file}: No title found`)
-      skipCount++
-      continue
-    }
+    for (const article of articles) {
+      try {
+        const existingPost = await checkExistingPost(article.title)
 
-    try {
-      // Check if post already exists
-      const existingPost = await checkExistingPost(title)
+        if (existingPost) {
+          console.log(`更新文章: ${article.title}`)
+          await updatePost(existingPost.id, article.title, article.content)
+          skipCount++
+        } else {
+          console.log(`创建新文章: ${article.title}`)
+          await createPost(article.title, article.content)
+          successCount++
+        }
 
-      if (existingPost) {
-        console.log(`Post already exists (ID: ${existingPost.id})`)
-        await updatePost(existingPost.id, title, content)
-        skipCount++
-      } else {
-        // Create new post
-        await createPost(title, content);
-        successCount++
+        // 频率限制，保护 SiteGround 服务器不被 508 (Resource Limit Reached)
+        await new Promise(r => setTimeout(r, DELAY_BETWEEN_REQUESTS))
+      } catch (err) {
+        console.error(`处理文章 [${article.title}] 失败:`, err.message)
+        errorCount++
       }
-    } catch (error) {
-      console.error(`Failed to process ${file}:`, error.message)
-      errorCount++
-    }
-
-    // Rate limiting - delay between requests
-    if (file !== files[files.length - 1]) {
-      // No delay after the last file
-      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS))
     }
   }
 
@@ -183,7 +221,7 @@ async function run() {
   console.log(`Successfully created: ${successCount} posts`)
   console.log(`Update (duplicates): ${skipCount} posts`)
   console.log(`Errors: ${errorCount} posts`)
-  console.log(`Total processed: ${files.length} files`)
+  console.log(`Total processed: ${successCount + skipCount + errorCount} files`)
 }
 
 run()
