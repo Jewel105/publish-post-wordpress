@@ -2,3 +2,4 @@ node_modules
 htmls*
 .env*
 pages*
+.claude
